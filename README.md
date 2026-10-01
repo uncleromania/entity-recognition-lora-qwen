@@ -2,6 +2,8 @@
 
 This project fine-tunes **Qwen2.5-1.5B-Instruct** to pull named entities out of news text and return them as JSON. It uses QLoRA (a 4-bit quantised base model with small trainable LoRA adapters), so the whole thing runs on a free Google Colab T4 GPU.
 
+> **What is NER?** Named entity recognition (NER) means finding the names of specific things in a piece of text and labelling what kind of thing each one is. For example, in *"Sarah Mensah, a Ghanaian engineer, joined the World Bank in London on 3 March"*, an NER system should find **Sarah Mensah** (Person), **Ghanaian** (Nationality/group), **World Bank** (Organization), **London** (Location) and **3 March** (Date). It's a basic building block for turning unstructured text, such as news, reports and emails, into structured data you can search, filter or analyse.
+
 The goal was to answer a practical question: for a structured extraction task, how far does prompting a small open model get you, and what does fine-tuning add?
 
 **Short answer:** prompting got an overall F1 of **0.18** (zero-shot) and **0.24** (3-shot). After two epochs of LoRA fine-tuning, the same model scored **0.86**.
@@ -45,10 +47,24 @@ Before training anything, the base model was evaluated with a system prompt that
 
 ### 4. QLoRA fine-tuning
 
-- Base model loaded in 4-bit NF4 with `bitsandbytes`.
-- LoRA adapters (rank 16, alpha 32, dropout 0.05) on all attention and MLP projections. That is roughly 18M trainable parameters, about 1.2% of the model.
-- Trained with TRL's `SFTTrainer` for 2 epochs, effective batch size 16, learning rate 2e-4 with cosine decay. Loss was computed on the completion (the JSON answer) only.
-- The trainable LoRA weights were cast to fp32. Without this, fp16 mixed-precision training on the T4 errors when unscaling gradients.
+In plain terms: rather than retraining the whole model, we froze it, compressed it to save memory, and trained a small add-on that teaches it this one job. Here's each piece.
+
+**Compressing the model to fit on a free GPU (4-bit NF4 quantisation).**
+A model's "knowledge" is stored as about 1.5 billion numbers (its *weights*). Normally each one takes 16 bits of memory. Here they were squashed down to 4 bits each using the `bitsandbytes` library. It's a bit like saving a photo as a heavily compressed JPEG: slightly less precise, but a quarter of the size. NF4 is the particular compression method. This is the "Q" (quantised) in QLoRA.
+
+**Training a small add-on instead of the whole model (LoRA adapters).**
+The original 1.5 billion weights are **frozen** and never change. A small set of new weights, called an *adapter*, is bolted on, and only that gets trained. That's about 18 million numbers, roughly 1.2% of the model's size. If you're from a software background, it's like overriding a few methods in a subclass instead of rewriting the base class. The model keeps its general understanding of English, and the adapter learns the specific task: "find the entities and label them the way this dataset does."
+- The adapter was attached to every one of the model's main internal layers (the *attention* and *MLP projection* layers), not just some of them.
+- *Rank 16* controls how big the adapter is. A bigger adapter can learn more, but it uses more memory.
+
+**The training run.**
+Training used Hugging Face's ready-made `SFTTrainer`. *SFT* (supervised fine-tuning) means "here's an input, here's the correct answer, learn to produce it."
+- **2 epochs:** the model saw every training example twice.
+- **Batch size 16:** it looks at 16 examples, measures how wrong it was on average, then nudges the adapter weights. It repeats that over and over.
+- **Learning rate 2e-4 with cosine decay:** the learning rate is how big each nudge is. Cosine decay starts with bigger nudges and gradually shrinks them, like taking big strides towards a target and then small careful steps as you get close.
+- **Marked on the answer only:** the model is only scored on the JSON answer it writes, not on whether it can repeat back the article or the instructions.
+
+**A bug fix worth knowing about.** Training initially crashed on the T4 GPU because of a number-precision mismatch in the mixed-precision setup. Keeping the small adapter in full 32-bit precision (fp32) while the rest of the model stayed compressed fixed it. This is a common gotcha when training on T4s.
 
 ### 5. Evaluation
 
@@ -129,10 +145,19 @@ Money is a useful contrast. It is also fairly rare (952 examples) but scores 0.9
 
 ## Next steps
 
-- Evaluate the final adapter once on the held-out test split.
-- Compare against a fine-tuned encoder (e.g. a BERT-style token classifier), which is the conventional NER baseline.
-- Improve the weak types by upsampling Facility and Product examples or tightening the type definitions.
-- Add a check that every predicted entity appears verbatim in the input text.
+**1. Get a final score from the untouched test set.**
+All the scores above come from the *validation* set. That's data I looked at while building and tuning the project, so it's slightly influenced by my choices. The *test* set (108 articles) has been kept aside and never used. Running the final model on it once gives the honest, final number. It's like keeping one exam paper you never practise on.
+
+**2. Compare against a traditional NER model.**
+Before LLMs, NER was usually done with smaller models such as BERT. Rather than writing out an answer, these read the text and put a label on each word. They're very good at this exact task and cheap to run. Comparing against one answers the obvious question: was an LLM actually the better tool here, or just the newer one?
+
+**3. Improve the weak entity types.**
+Product, Facility and Misc scored badly, mostly because there were so few examples of them. Two ways to fix that:
+- **Show them more often:** repeat training examples that contain these types (known as *upsampling*), so the model gets more practice on them.
+- **Write clearer definitions:** "Misc" is vague even for a human. Tighter rules in the prompt about what belongs in each type should help.
+
+**4. Catch made-up answers.**
+LLMs can invent things. At the moment, if the model "finds" an entity that isn't actually in the article, it's just counted as a wrong answer. A simple check that every predicted name appears word for word in the input would measure how often this happens. In a real system, the same check could filter out made-up answers before anyone sees them.
 
 ## Running it
 
